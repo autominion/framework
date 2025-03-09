@@ -1,7 +1,7 @@
 use bytes::Bytes;
 
 /// Create a Git error message in the proper side‑band pkt‑line format.
-pub(super) fn create_git_error_message(message: &str) -> Bytes {
+pub fn create_git_error_message(message: &str) -> Bytes {
     let full_message = format!("error: {}\n", message);
 
     let mut line = Vec::new();

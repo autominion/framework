@@ -2,10 +2,14 @@ use actix_web::{get, post, web, Error, HttpMessage, HttpRequest, HttpResponse, R
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use reqwest::Client;
+use std::process::Stdio;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 
-use crate::errors::create_git_error_message;
-use crate::parse_commands::{parse_update_requests, RefModification};
-use crate::{ForwardToRemote, ProxyBehaivor};
+use crate::packet_line::advertisement::create_git_advertisement;
+use crate::packet_line::errors::create_git_error_message;
+use crate::packet_line::parse_commands::{parse_update_requests, RefModification};
+use crate::{Forward, ForwardToLocal, ForwardToRemote, ProxyBehaivor};
 
 /// GET /info/refs?service=<service>
 ///
@@ -19,12 +23,14 @@ async fn info_refs_handler(req: HttpRequest) -> impl Responder {
         return HttpResponse::BadRequest().body("Unsupported or missing service");
     }
 
-    let ProxyBehaivor::ForwardToRemote(forward) = proxy_behaivor(&req);
-
-    forward_info_refs(&forward, query).await
+    let behaivor = proxy_behaivor(&req);
+    match behaivor.forward {
+        Forward::ForwardToRemote(ref forward) => remote_info_refs(forward, query).await,
+        Forward::ForwardToLocal(ref local) => local_info_refs(local, query).await,
+    }
 }
 
-async fn forward_info_refs(forward: &ForwardToRemote, query: &str) -> HttpResponse {
+async fn remote_info_refs(forward: &ForwardToRemote, query: &str) -> HttpResponse {
     let mut forward_url = forward.url.clone();
     {
         let mut segments = forward_url.path_segments_mut().expect("Cannot modify URL segments");
@@ -58,6 +64,36 @@ async fn forward_info_refs(forward: &ForwardToRemote, query: &str) -> HttpRespon
     }
 }
 
+async fn local_info_refs(forward: &ForwardToLocal, query: &str) -> HttpResponse {
+    let (service, content_type) = if query.contains("service=git-receive-pack") {
+        ("git-receive-pack", "application/x-git-receive-pack-advertisement")
+    } else if query.contains("service=git-upload-pack") {
+        ("git-upload-pack", "application/x-git-upload-pack-advertisement")
+    } else {
+        return HttpResponse::BadRequest().body("Unsupported or missing service");
+    };
+
+    let output =
+        match Command::new(service).arg("--advertise-refs").arg(&forward.path).output().await {
+            Ok(o) => o,
+            Err(err) => {
+                log::error!("Error spawning {}: {:?}", service, err);
+                return HttpResponse::InternalServerError()
+                    .body(format!("Error spawning {}", service));
+            }
+        };
+
+    if !output.status.success() {
+        log::error!("Command {} exited with non-zero status", service);
+        return HttpResponse::InternalServerError().body("Error processing info/refs");
+    }
+
+    // Prepend the Git advertisement header.
+    let advertisement = create_git_advertisement(service, &output.stdout);
+
+    HttpResponse::Ok().content_type(content_type).body(advertisement)
+}
+
 /// POST /git-receive-pack
 ///
 /// This endpoint is used by Git clients to push updates.
@@ -75,12 +111,12 @@ async fn git_receive_pack_handler(
     }
     let body_bytes = body.freeze();
 
-    let ProxyBehaivor::ForwardToRemote(forward) = proxy_behaivor(&req);
+    let behaivor = proxy_behaivor(&req);
 
     match parse_update_requests(&body_bytes) {
         Ok(refs) => {
             for r in refs {
-                if r.ref_name() != forward.allowed_ref {
+                if r.ref_name() != behaivor.allowed_ref {
                     log::warn!("Push attempted to disallowed ref: {}", r.ref_name());
                     let error_body =
                         create_git_error_message("Push not allowed to modify this ref");
@@ -118,10 +154,15 @@ async fn git_receive_pack_handler(
         }
     }
 
-    Ok(forward_git_receive_pack(&forward, body_bytes).await)
+    let response = match behaivor.forward {
+        Forward::ForwardToRemote(ref forward) => remote_git_receive_pack(forward, body_bytes).await,
+        Forward::ForwardToLocal(ref local) => local_git_receive_pack(local, body_bytes).await,
+    };
+
+    Ok(response)
 }
 
-async fn forward_git_receive_pack(forward: &ForwardToRemote, body_bytes: Bytes) -> HttpResponse {
+async fn remote_git_receive_pack(forward: &ForwardToRemote, body_bytes: Bytes) -> HttpResponse {
     let mut forward_url = forward.url.clone();
     {
         let mut segments = forward_url.path_segments_mut().expect("Cannot modify URL segments");
@@ -159,6 +200,53 @@ async fn forward_git_receive_pack(forward: &ForwardToRemote, body_bytes: Bytes) 
     }
 }
 
+async fn local_git_receive_pack(forward: &ForwardToLocal, body_bytes: Bytes) -> HttpResponse {
+    let mut child = match Command::new("git-receive-pack")
+        .arg("--stateless-rpc")
+        .arg(&forward.path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            log::error!("Error spawning git-receive-pack: {:?}", err);
+            let error_body = create_git_error_message("Error spawning git-receive-pack");
+            return HttpResponse::Ok()
+                .content_type("application/x-git-receive-pack-result")
+                .body(error_body);
+        }
+    };
+
+    // Write the request body to the child’s stdin.
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(err) = stdin.write_all(&body_bytes).await {
+            log::error!("Error writing to git-receive-pack stdin: {:?}", err);
+        }
+    }
+
+    let output = match child.wait_with_output().await {
+        Ok(o) => o,
+        Err(err) => {
+            log::error!("Error waiting for git-receive-pack: {:?}", err);
+            let error_body = create_git_error_message("Error processing push");
+            return HttpResponse::Ok()
+                .content_type("application/x-git-receive-pack-result")
+                .body(error_body);
+        }
+    };
+
+    if !output.status.success() {
+        log::error!("git-receive-pack exited with non-zero status");
+        let error_body = create_git_error_message("git-receive-pack failed");
+        return HttpResponse::Ok()
+            .content_type("application/x-git-receive-pack-result")
+            .body(error_body);
+    }
+
+    HttpResponse::Ok().content_type("application/x-git-receive-pack-result").body(output.stdout)
+}
+
 /// POST /git-upload-pack
 ///
 /// This endpoint is used by Git clients to fetch objects (clone or fetch).
@@ -175,12 +263,16 @@ async fn git_upload_pack_handler(
     }
     let body_bytes = body.freeze();
 
-    let ProxyBehaivor::ForwardToRemote(forward) = proxy_behaivor(&req);
+    let behaivor = proxy_behaivor(&req);
+    let response = match behaivor.forward {
+        Forward::ForwardToRemote(ref forward) => remote_git_upload_pack(forward, body_bytes).await,
+        Forward::ForwardToLocal(ref local) => local_git_upload_pack(local, body_bytes).await,
+    };
 
-    Ok(forward_git_upload_pack(&forward, body_bytes).await)
+    Ok(response)
 }
 
-async fn forward_git_upload_pack(forward: &ForwardToRemote, body_bytes: Bytes) -> HttpResponse {
+async fn remote_git_upload_pack(forward: &ForwardToRemote, body_bytes: Bytes) -> HttpResponse {
     let mut forward_url = forward.url.clone();
     {
         let mut segments = forward_url.path_segments_mut().expect("Cannot modify URL segments");
@@ -213,6 +305,43 @@ async fn forward_git_upload_pack(forward: &ForwardToRemote, body_bytes: Bytes) -
             HttpResponse::InternalServerError().body("Error forwarding fetch")
         }
     }
+}
+
+async fn local_git_upload_pack(forward: &ForwardToLocal, body_bytes: Bytes) -> HttpResponse {
+    let mut child = match Command::new("git-upload-pack")
+        .arg("--stateless-rpc")
+        .arg(&forward.path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            log::error!("Error spawning git-upload-pack: {:?}", err);
+            return HttpResponse::InternalServerError().body("Error spawning git-upload-pack");
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(err) = stdin.write_all(&body_bytes).await {
+            log::error!("Error writing to git-upload-pack stdin: {:?}", err);
+        }
+    }
+
+    let output = match child.wait_with_output().await {
+        Ok(o) => o,
+        Err(err) => {
+            log::error!("Error waiting for git-upload-pack: {:?}", err);
+            return HttpResponse::InternalServerError().body("Error processing fetch");
+        }
+    };
+
+    if !output.status.success() {
+        log::error!("git-upload-pack exited with non-zero status");
+        return HttpResponse::InternalServerError().body("git-upload-pack failed");
+    }
+
+    HttpResponse::Ok().content_type("application/x-git-upload-pack-result").body(output.stdout)
 }
 
 /// Extract the `ProxyBehaivor` from the request extensions.

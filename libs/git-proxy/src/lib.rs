@@ -29,6 +29,7 @@
 //! - [Git wire protocol v2 documentation](https://git-scm.com/docs/protocol-v2)
 
 use std::future::Future;
+use std::path::PathBuf;
 
 use actix_web::body::{BoxBody, EitherBody};
 use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
@@ -37,43 +38,62 @@ use actix_web_httpauth::extractors::basic::BasicAuth;
 use actix_web_httpauth::middleware::HttpAuthentication;
 use url::Url;
 
-mod errors;
-mod parse_commands;
-mod parse_tests;
+mod packet_line;
 mod routes;
 
 use routes::{git_receive_pack_handler, git_upload_pack_handler, info_refs_handler};
 
 /// What the proxy should do with the request.
-#[derive(Clone)]
-pub enum ProxyBehaivor {
-    /// Forward the request to another Git server.
-    ForwardToRemote(ForwardToRemote),
-}
-
-/// Configuration details for forwarding Git requests to another server.
 ///
 /// # Usage
 ///
 /// In your authentication validator function, supply an instance of this struct to the Actix Web request extensions.
-/// For a basic usage example, see the `basic` example in the `examples` directory.
-///
-/// # Fields
-///
-/// * `url` - The upstream Git server's URL to which Git commands are forwarded.
-/// * `basic_auth_user` - The username used for Basic Authentication when
-///                       communicating with the upstream server.
-/// * `basic_auth_pass` - The password used for Basic Authentication when
-///                       communicating with the upstream server.
-/// * `allowed_ref`     - A reference (e.g., "refsrefs/heads/main") indicating which
-///                       ref/branch is allowed to be updated during a push operation.
-///                       Pushes to other will be denied.
+/// For usage examples, see the `examples` directory.
+#[derive(Clone)]
+pub struct ProxyBehaivor {
+    /// A reference (e.g., "refs/heads/main") indicating which ref/branch is allowed to be updated during a push operation.
+    /// Pushes to other refs will be denied.
+    pub allowed_ref: String,
+    /// How to forward the request.
+    pub forward: Forward,
+}
+
+/// How to forward the request.
+#[derive(Clone)]
+pub enum Forward {
+    /// Forward the request to another Git server.
+    ForwardToRemote(ForwardToRemote),
+    /// Forward the request to a local Git repository.
+    ForwardToLocal(ForwardToLocal),
+}
+
+impl From<ForwardToRemote> for Forward {
+    fn from(f: ForwardToRemote) -> Self {
+        Forward::ForwardToRemote(f)
+    }
+}
+
+impl From<ForwardToLocal> for Forward {
+    fn from(f: ForwardToLocal) -> Self {
+        Forward::ForwardToLocal(f)
+    }
+}
+
+/// Forward Git requests to another server.
 #[derive(Clone)]
 pub struct ForwardToRemote {
+    /// The upstream Git server's URL to which Git commands are forwarded.
     pub url: Url,
+    /// The username used for Basic Authentication with the upstream server.
     pub basic_auth_user: String,
+    /// The password used for Basic Authentication with the upstream server.
     pub basic_auth_pass: String,
-    pub allowed_ref: String,
+}
+
+/// Forward Git requests to a local Git repository.
+#[derive(Clone)]
+pub struct ForwardToLocal {
+    pub path: PathBuf,
 }
 
 /// Create an `actix_web::Scope` configured to handle the v2 wire protocol over the Git smart HTTP transfer protocol.

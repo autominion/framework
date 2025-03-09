@@ -27,12 +27,15 @@ async fn basic_auth_validator(
         let auth_user = "x-access-token".to_string();
         let auth_pass = env::var("FORWARD_TOKEN").expect("FORWARD_TOKEN must be set");
 
-        req.extensions_mut().insert(ProxyBehaivor::ForwardToRemote(ForwardToRemote {
-            url,
-            basic_auth_user: auth_user,
-            basic_auth_pass: auth_pass,
+        req.extensions_mut().insert(ProxyBehaivor {
             allowed_ref: ALLOWED_REF.to_string(),
-        }));
+            forward: ForwardToRemote {
+                url,
+                basic_auth_user: auth_user,
+                basic_auth_pass: auth_pass,
+            }
+            .into(),
+        });
 
         Ok(req)
     } else {

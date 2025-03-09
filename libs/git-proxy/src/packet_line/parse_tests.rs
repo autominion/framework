@@ -6,6 +6,7 @@ use std::str;
 use nom::error::ErrorKind;
 
 use super::parse_commands::*;
+use super::pkt_line_string;
 
 // Test fixtures
 //
@@ -14,13 +15,6 @@ use super::parse_commands::*;
 /// Create a flush packet ("0000") as a String.
 fn flush_pkt() -> String {
     "0000".to_string()
-}
-
-/// Create a packet line as a String.
-/// The first 4 characters are the total length (header + payload) in hexadecimal.
-fn pkt_line_string(s: &str) -> String {
-    let total_len = s.len() + 4;
-    format!("{:04x}{}", total_len, s)
 }
 
 /// Build a push-cert input given optional push-option lines,
