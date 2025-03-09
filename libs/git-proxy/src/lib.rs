@@ -45,6 +45,7 @@ mod routes;
 use routes::{git_receive_pack_handler, git_upload_pack_handler, info_refs_handler};
 
 /// What the proxy should do with the request.
+#[derive(Clone)]
 pub enum ProxyBehaivor {
     /// Forward the request to another Git server.
     ForwardToRemote(ForwardToRemote),

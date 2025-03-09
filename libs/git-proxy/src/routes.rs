@@ -13,20 +13,13 @@ use crate::{ForwardToRemote, ProxyBehaivor};
 /// the handshake is initiated here. We forward both push (git-receive-pack)
 /// and fetch (git-upload-pack) info requests.
 #[get("/info/refs")]
-// False positive: the RefCell `extensions` is not used accross the await point
-#[allow(clippy::await_holding_refcell_ref)]
 async fn info_refs_handler(req: HttpRequest) -> impl Responder {
     let query = req.query_string();
     if !query.contains("service=git-receive-pack") && !query.contains("service=git-upload-pack") {
         return HttpResponse::BadRequest().body("Unsupported or missing service");
     }
 
-    let extensions = req.extensions();
-    let ProxyBehaivor::ForwardToRemote(forward) =
-        extensions.get::<ProxyBehaivor>().expect("ProxyBehaivor extension not found");
-    let forward = forward.clone();
-    // Ensure the `RefCell` is not held accross an await point
-    drop(extensions);
+    let ProxyBehaivor::ForwardToRemote(forward) = proxy_behaivor(&req);
 
     forward_info_refs(&forward, query).await
 }
@@ -71,8 +64,6 @@ async fn forward_info_refs(forward: &ForwardToRemote, query: &str) -> HttpRespon
 /// We first inspect the push commands to ensure that they only affect the allowed ref,
 /// and if so we forward the entire request.
 #[post("/git-receive-pack")]
-// False positive: the RefCell `extensions` is not used accross the await point
-#[allow(clippy::await_holding_refcell_ref)]
 async fn git_receive_pack_handler(
     req: HttpRequest,
     mut payload: web::Payload,
@@ -84,12 +75,7 @@ async fn git_receive_pack_handler(
     }
     let body_bytes = body.freeze();
 
-    let extensions = req.extensions();
-    let ProxyBehaivor::ForwardToRemote(forward) =
-        extensions.get::<ProxyBehaivor>().expect("ProxyBehaivor extension not found");
-    let forward = forward.clone();
-    // Ensure the `RefCell` is not held accross an await point
-    drop(extensions);
+    let ProxyBehaivor::ForwardToRemote(forward) = proxy_behaivor(&req);
 
     match parse_update_requests(&body_bytes) {
         Ok(refs) => {
@@ -178,8 +164,6 @@ async fn forward_git_receive_pack(forward: &ForwardToRemote, body_bytes: Bytes) 
 /// This endpoint is used by Git clients to fetch objects (clone or fetch).
 /// Unlike push, no ref restrictions are needed, so we simply forward the request.
 #[post("/git-upload-pack")]
-// False positive: the RefCell `extensions` is not used accross the await point
-#[allow(clippy::await_holding_refcell_ref)]
 async fn git_upload_pack_handler(
     req: HttpRequest,
     mut payload: web::Payload,
@@ -191,12 +175,7 @@ async fn git_upload_pack_handler(
     }
     let body_bytes = body.freeze();
 
-    let extensions = req.extensions();
-    let ProxyBehaivor::ForwardToRemote(forward) =
-        extensions.get::<ProxyBehaivor>().expect("ProxyBehaivor extension not found");
-    let forward = forward.clone();
-    // Ensure the `RefCell` is not held accross an await point
-    drop(extensions);
+    let ProxyBehaivor::ForwardToRemote(forward) = proxy_behaivor(&req);
 
     Ok(forward_git_upload_pack(&forward, body_bytes).await)
 }
@@ -234,4 +213,10 @@ async fn forward_git_upload_pack(forward: &ForwardToRemote, body_bytes: Bytes) -
             HttpResponse::InternalServerError().body("Error forwarding fetch")
         }
     }
+}
+
+/// Extract the `ProxyBehaivor` from the request extensions.
+fn proxy_behaivor(request: &HttpRequest) -> ProxyBehaivor {
+    let extensions = request.extensions();
+    extensions.get::<ProxyBehaivor>().expect("ProxyBehaivor extension not found").clone()
 }
