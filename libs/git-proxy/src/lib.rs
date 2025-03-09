@@ -13,8 +13,8 @@
 //!    your Actix Web server at the path defined in [`scope`].
 //! 2. An optional Basic Authentication check (the validator you provide) runs,
 //!    ensuring the request is authorized to access the proxy.
-//!    This check needs to supply a [`ForwardRepo`] instance to the request extensions
-//!    which will tell the proxy where to forward the Git requests.
+//!    This check needs to supply a [`ProxyBehaivor`] instance to the request extensions
+//!    which will tell the proxy how to forward the Git requests.
 //! 3. The proxy inspects the request body of push requests to apply any configured restrictions.
 //!    Currently, push requests are restricted to a single specific ref (e.g. branch) configured by `allowed_ref`.
 //!    deletion and creation of refs is forbidden.
@@ -44,6 +44,12 @@ mod routes;
 
 use routes::{git_receive_pack_handler, git_upload_pack_handler, info_refs_handler};
 
+/// What the proxy should do with the request.
+pub enum ProxyBehaivor {
+    /// Forward the request to another Git server.
+    ForwardToRemote(ForwardToRemote),
+}
+
 /// Configuration details for forwarding Git requests to another server.
 ///
 /// # Usage
@@ -61,7 +67,8 @@ use routes::{git_receive_pack_handler, git_upload_pack_handler, info_refs_handle
 /// * `allowed_ref`     - A reference (e.g., "refsrefs/heads/main") indicating which
 ///                       ref/branch is allowed to be updated during a push operation.
 ///                       Pushes to other will be denied.
-pub struct ForwardRepo {
+#[derive(Clone)]
+pub struct ForwardToRemote {
     pub url: Url,
     pub basic_auth_user: String,
     pub basic_auth_pass: String,

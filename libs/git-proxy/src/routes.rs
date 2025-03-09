@@ -1,11 +1,11 @@
 use actix_web::{get, post, web, Error, HttpMessage, HttpRequest, HttpResponse, Responder};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use reqwest::Client;
 
 use crate::errors::create_git_error_message;
 use crate::parse_commands::{parse_update_requests, RefModification};
-use crate::ForwardRepo;
+use crate::{ForwardToRemote, ProxyBehaivor};
 
 /// GET /info/refs?service=<service>
 ///
@@ -19,14 +19,25 @@ async fn info_refs_handler(req: HttpRequest) -> impl Responder {
     let query = req.query_string();
     if !query.contains("service=git-receive-pack") && !query.contains("service=git-upload-pack") {
         return HttpResponse::BadRequest().body("Unsupported or missing service");
-    };
+    }
 
     let extensions = req.extensions();
-    let forward = extensions.get::<ForwardRepo>().expect("ForwardRepo extension not found");
+    let ProxyBehaivor::ForwardToRemote(forward) =
+        extensions.get::<ProxyBehaivor>().expect("ProxyBehaivor extension not found");
+    let forward = forward.clone();
+    // Ensure the `RefCell` is not held accross an await point
+    drop(extensions);
 
+    forward_info_refs(&forward, query).await
+}
+
+async fn forward_info_refs(forward: &ForwardToRemote, query: &str) -> HttpResponse {
     let mut forward_url = forward.url.clone();
-    forward_url.path_segments_mut().unwrap().push("info");
-    forward_url.path_segments_mut().unwrap().push("refs");
+    {
+        let mut segments = forward_url.path_segments_mut().expect("Cannot modify URL segments");
+        segments.push("info");
+        segments.push("refs");
+    }
     forward_url.set_query(Some(query));
 
     let client = Client::new();
@@ -66,7 +77,7 @@ async fn git_receive_pack_handler(
     req: HttpRequest,
     mut payload: web::Payload,
 ) -> Result<HttpResponse, Error> {
-    let mut body = web::BytesMut::new();
+    let mut body = BytesMut::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk?;
         body.extend_from_slice(&chunk);
@@ -74,7 +85,11 @@ async fn git_receive_pack_handler(
     let body_bytes = body.freeze();
 
     let extensions = req.extensions();
-    let forward = extensions.get::<ForwardRepo>().expect("ForwardRepo extension not found");
+    let ProxyBehaivor::ForwardToRemote(forward) =
+        extensions.get::<ProxyBehaivor>().expect("ProxyBehaivor extension not found");
+    let forward = forward.clone();
+    // Ensure the `RefCell` is not held accross an await point
+    drop(extensions);
 
     match parse_update_requests(&body_bytes) {
         Ok(refs) => {
@@ -87,7 +102,6 @@ async fn git_receive_pack_handler(
                         .content_type("application/x-git-receive-pack-result")
                         .body(error_body));
                 }
-
                 match r {
                     RefModification::Create { .. } => {
                         log::warn!("Push attempted to create ref: {}", r.ref_name());
@@ -118,15 +132,19 @@ async fn git_receive_pack_handler(
         }
     }
 
-    let mut forward_url = forward.url.clone();
-    forward_url.path_segments_mut().unwrap().push("git-receive-pack");
-    let basic_auth_user = forward.basic_auth_user.clone();
-    let basic_auth_pass = forward.basic_auth_pass.clone();
+    Ok(forward_git_receive_pack(&forward, body_bytes).await)
+}
 
+async fn forward_git_receive_pack(forward: &ForwardToRemote, body_bytes: Bytes) -> HttpResponse {
+    let mut forward_url = forward.url.clone();
+    {
+        let mut segments = forward_url.path_segments_mut().expect("Cannot modify URL segments");
+        segments.push("git-receive-pack");
+    }
     let client = Client::new();
     match client
         .post(forward_url)
-        .basic_auth(basic_auth_user, Some(basic_auth_pass))
+        .basic_auth(forward.basic_auth_user.clone(), Some(forward.basic_auth_pass.clone()))
         .header("Content-Type", "application/x-git-receive-pack-request")
         .body(body_bytes.clone())
         .send()
@@ -140,17 +158,17 @@ async fn git_receive_pack_handler(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("application/octet-stream")
                 .to_string();
-            let resp_body = resp.bytes().await.unwrap_or_else(|_| bytes::Bytes::new());
-            Ok(HttpResponse::build(status)
+            let resp_body = resp.bytes().await.unwrap_or_else(|_| Bytes::new());
+            HttpResponse::build(status)
                 .insert_header(("Content-Type", content_type))
-                .body(resp_body))
+                .body(resp_body)
         }
         Err(err) => {
             log::error!("Error forwarding git-receive-pack: {:?}", err);
             let error_body = create_git_error_message("Error forwarding push");
-            Ok(HttpResponse::Ok()
+            HttpResponse::Ok()
                 .content_type("application/x-git-receive-pack-result")
-                .body(error_body))
+                .body(error_body)
         }
     }
 }
@@ -166,7 +184,7 @@ async fn git_upload_pack_handler(
     req: HttpRequest,
     mut payload: web::Payload,
 ) -> Result<HttpResponse, Error> {
-    let mut body = web::BytesMut::new();
+    let mut body = BytesMut::new();
     while let Some(chunk) = payload.next().await {
         let chunk = chunk?;
         body.extend_from_slice(&chunk);
@@ -174,16 +192,25 @@ async fn git_upload_pack_handler(
     let body_bytes = body.freeze();
 
     let extensions = req.extensions();
-    let forward = extensions.get::<ForwardRepo>().expect("ForwardRepo extension not found");
-    let mut forward_url = forward.url.clone();
-    forward_url.path_segments_mut().unwrap().push("git-upload-pack");
-    let basic_auth_user = forward.basic_auth_user.clone();
-    let basic_auth_pass = forward.basic_auth_pass.clone();
+    let ProxyBehaivor::ForwardToRemote(forward) =
+        extensions.get::<ProxyBehaivor>().expect("ProxyBehaivor extension not found");
+    let forward = forward.clone();
+    // Ensure the `RefCell` is not held accross an await point
+    drop(extensions);
 
+    Ok(forward_git_upload_pack(&forward, body_bytes).await)
+}
+
+async fn forward_git_upload_pack(forward: &ForwardToRemote, body_bytes: Bytes) -> HttpResponse {
+    let mut forward_url = forward.url.clone();
+    {
+        let mut segments = forward_url.path_segments_mut().expect("Cannot modify URL segments");
+        segments.push("git-upload-pack");
+    }
     let client = Client::new();
     match client
         .post(forward_url)
-        .basic_auth(basic_auth_user, Some(basic_auth_pass))
+        .basic_auth(forward.basic_auth_user.clone(), Some(forward.basic_auth_pass.clone()))
         .header("Content-Type", "application/x-git-upload-pack-request")
         .body(body_bytes.clone())
         .send()
@@ -198,13 +225,13 @@ async fn git_upload_pack_handler(
                 .unwrap_or("application/octet-stream")
                 .to_string();
             let resp_body = resp.bytes().await.unwrap_or_else(|_| Bytes::new());
-            Ok(HttpResponse::build(status)
+            HttpResponse::build(status)
                 .insert_header(("Content-Type", content_type))
-                .body(resp_body))
+                .body(resp_body)
         }
         Err(err) => {
             log::error!("Error forwarding git-upload-pack: {:?}", err);
-            Ok(HttpResponse::InternalServerError().body("Error forwarding fetch"))
+            HttpResponse::InternalServerError().body("Error forwarding fetch")
         }
     }
 }

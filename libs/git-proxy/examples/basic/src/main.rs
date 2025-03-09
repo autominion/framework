@@ -5,14 +5,14 @@ use actix_web::error::ErrorUnauthorized;
 use actix_web::{App, Error, HttpMessage, HttpServer};
 use actix_web_httpauth::extractors::basic::BasicAuth;
 
-use git_proxy::{scope, ForwardRepo};
+use git_proxy::{scope, ForwardToRemote, ProxyBehaivor};
 
 // Hard-coded Basic Auth credentials for demonstration.
 const USER: &str = "my-user";
 const TOKEN: &str = "my-token";
 const ALLOWED_REF: &str = "refs/heads/allow";
 
-/// Validate BasicAuth credentials and, if valid, store a `ForwardRepo` in the request extensions.
+/// Validate BasicAuth credentials and, if valid, store a `ProxyBehaivor` in the request extensions.
 async fn basic_auth_validator(
     req: ServiceRequest,
     credentials: BasicAuth,
@@ -27,12 +27,12 @@ async fn basic_auth_validator(
         let auth_user = "x-access-token".to_string();
         let auth_pass = env::var("FORWARD_TOKEN").expect("FORWARD_TOKEN must be set");
 
-        req.extensions_mut().insert(ForwardRepo {
+        req.extensions_mut().insert(ProxyBehaivor::ForwardToRemote(ForwardToRemote {
             url,
             basic_auth_user: auth_user,
             basic_auth_pass: auth_pass,
             allowed_ref: ALLOWED_REF.to_string(),
-        });
+        }));
 
         Ok(req)
     } else {
