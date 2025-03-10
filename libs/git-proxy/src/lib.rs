@@ -38,6 +38,7 @@ use actix_web_httpauth::extractors::basic::BasicAuth;
 use actix_web_httpauth::middleware::HttpAuthentication;
 use url::Url;
 
+mod compression;
 mod packet_line;
 mod routes;
 

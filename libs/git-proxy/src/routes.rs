@@ -1,3 +1,4 @@
+use actix_web::http::header::HeaderMap;
 use actix_web::{get, post, web, Error, HttpMessage, HttpRequest, HttpResponse, Responder};
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
@@ -6,6 +7,7 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::compression;
 use crate::packet_line::advertisement::create_git_advertisement;
 use crate::packet_line::errors::create_git_error_message;
 use crate::packet_line::parse_commands::{parse_update_requests, RefModification};
@@ -109,7 +111,9 @@ async fn git_receive_pack_handler(
         let chunk = chunk?;
         body.extend_from_slice(&chunk);
     }
+
     let body_bytes = body.freeze();
+    let body_bytes = decompress_if_gzip(body_bytes, req.headers()).await?;
 
     let behaivor = proxy_behaivor(&req);
 
@@ -261,7 +265,9 @@ async fn git_upload_pack_handler(
         let chunk = chunk?;
         body.extend_from_slice(&chunk);
     }
+
     let body_bytes = body.freeze();
+    let body_bytes = decompress_if_gzip(body_bytes, req.headers()).await?;
 
     let behaivor = proxy_behaivor(&req);
     let response = match behaivor.forward {
@@ -348,4 +354,21 @@ async fn local_git_upload_pack(forward: &ForwardToLocal, body_bytes: Bytes) -> H
 fn proxy_behaivor(request: &HttpRequest) -> ProxyBehaivor {
     let extensions = request.extensions();
     extensions.get::<ProxyBehaivor>().expect("ProxyBehaivor extension not found").clone()
+}
+
+/// Decompress the request body if it is encoded with gzip.
+async fn decompress_if_gzip(body_bytes: Bytes, headers: &HeaderMap) -> Result<Bytes, Error> {
+    if let Some(encoding) = headers.get("Content-Encoding") {
+        let encoding_str = encoding.to_str().unwrap_or("").trim();
+        if encoding_str.eq_ignore_ascii_case("gzip") {
+            let decompressed = compression::decompress_gzip(&body_bytes).await.map_err(|e| {
+                log::error!("Error decompressing body: {:?}", e);
+                actix_web::error::ErrorBadRequest("Decompression failed")
+            })?;
+            return Ok(Bytes::from(decompressed));
+        } else {
+            log::error!("Unsupported Content-Encoding: {:?}", encoding);
+        }
+    }
+    Ok(body_bytes)
 }
