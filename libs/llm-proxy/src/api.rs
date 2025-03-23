@@ -1,12 +1,14 @@
 use std::time::Duration;
 
 use actix_web::{
+    body::BoxBody,
     web::{self, Json},
     HttpRequest, HttpResponse, Scope,
 };
 use futures_util::StreamExt;
 use reqwest::Client;
 use url::Url;
+use uuid::Uuid;
 
 use crate::config::ProxyConfig;
 use crate::requests::CompletionRequest;
@@ -51,9 +53,14 @@ async fn completions<C: ProxyConfig>(
         config.inspect_interaction(&ctx, &request_payload, None).await;
         Ok(forward_stream_request(&api_key, target_url, &request_payload).await)
     } else {
-        let (resp, response_json) =
+        let (mut resp, mut response_json) =
             forward_non_stream_request(&api_key, target_url, &request_payload).await?;
+        if let Some(response_json) = &mut response_json {
+            patch_response(response_json);
+            resp = resp.set_body(BoxBody::new(response_json.to_string()));
+        }
         config.inspect_interaction(&ctx, &request_payload, response_json).await;
+
         Ok(resp)
     }
 }
@@ -143,4 +150,16 @@ async fn forward_stream_request(
         .append_header(("Content-Type", "text/event-stream"))
         .append_header(("Cache-Control", "no-cache"))
         .streaming(byte_stream)
+}
+
+/// Some providers that offer a mostly but not fully OpenAI-compatible APIs
+/// One example is Google Gemini's API, which does not include the `id` field in the response.
+/// Since clients may expect this field to be present when deserializing the response, we patch the response
+/// by adding the `id` field with a dummy value.
+fn patch_response(response_json: &mut serde_json::Value) {
+    if let Some(obj) = response_json.as_object_mut() {
+        if obj.get("id").is_none() {
+            obj.insert("id".to_string(), serde_json::Value::String(Uuid::new_v4().to_string()));
+        }
+    }
 }
